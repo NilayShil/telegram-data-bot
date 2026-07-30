@@ -7,22 +7,25 @@ import traceback
 import requests
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
-from openai import OpenAI
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Initialize Gemini Client
+client = genai.Client(api_key=GEMINI_API_KEY)
 app = FastAPI()
 
 LOG_FILE = "run.jsonl"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 CHAT_HISTORIES = {}
 
+# 1. Logging Helper
 def log_event(event_type, data):
     log_entry = {
         "timestamp": time.time(),
@@ -32,15 +35,8 @@ def log_event(event_type, data):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(log_entry) + "\n")
 
+# 2. Safe Python Execution Tool
 def run_python(code: str) -> str:
-    """Executes Python code safely and captures stdout or local variables."""
-    import sys
-    import io
-
-    # Redirect stdout to capture prints
-    old_stdout = sys.stdout
-    redirected_output = sys.stdout = io.StringIO()
-
     local_scope = {}
     try:
         exec_globals = {
@@ -50,18 +46,12 @@ def run_python(code: str) -> str:
             "bs4": __import__("bs4"),
         }
         exec(code, exec_globals, local_scope)
-        sys.stdout = old_stdout
-        
-        printed_val = redirected_output.getvalue()
-        if printed_val.strip():
-            return printed_val[-8000:]
-            
         output = local_scope.get("result", local_scope)
         return str(output)[-8000:]
     except Exception as e:
-        sys.stdout = old_stdout
         return f"Error executing code: {str(e)}"
 
+# 3. JSON Sanitizer
 def parse_and_clean_json(raw_text: str) -> dict:
     log_url = f"{BASE_URL}/run.jsonl"
     try:
@@ -78,14 +68,15 @@ def parse_and_clean_json(raw_text: str) -> dict:
     except Exception:
         return {"answer": raw_text, "log_url": log_url}
 
+# 4. Gemini Agent Loop
 def run_agent(chat_id: int, user_message: str) -> dict:
     if chat_id not in CHAT_HISTORIES:
         CHAT_HISTORIES[chat_id] = []
 
-    CHAT_HISTORIES[chat_id].append({"role": "user", "content": user_message})
+    CHAT_HISTORIES[chat_id].append({"role": "user", "parts": [{"text": user_message}]})
     CHAT_HISTORIES[chat_id] = CHAT_HISTORIES[chat_id][-20:]
 
-    system_prompt = (
+    system_instruction = (
         "You are an expert data analysis bot. Always answer the latest user message.\n"
         "Use the run_python tool whenever you need to download, parse, or compute data.\n"
         "Reply with ONLY the exact raw JSON structure requested in the prompt. "
@@ -93,75 +84,74 @@ def run_agent(chat_id: int, user_message: str) -> dict:
         "Include a dummy 'log_url' field in your JSON response."
     )
 
-    tools = [{
-        "type": "function",
-        "function": {
-            "name": "run_python",
-            "description": "Execute Python code to fetch and analyze data.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "code": {"type": "string", "description": "Python code to run"}
-                },
-                "required": ["code"]
-            }
-        }
-    }]
+    # Define tool for Gemini
+    python_tool = types.Tool(
+        function_declarations=[
+            types.FunctionDeclaration(
+                name="run_python",
+                description="Execute Python code to fetch and analyze data.",
+                parameters=types.Schema(
+                    type="OBJECT",
+                    properties={
+                        "code": types.Schema(
+                            type="STRING",
+                            description="Python code block to execute"
+                        )
+                    },
+                    required=["code"]
+                )
+            )
+        ]
+    )
 
-    messages = [{"role": "system", "content": system_prompt}] + CHAT_HISTORIES[chat_id]
+    contents = CHAT_HISTORIES[chat_id].copy()
     start_time = time.time()
 
     for step in range(10):
-        if time.time() - start_time > 210:
+        if time.time() - start_time > 210:  # Timeout safety budget
             log_event("timeout_warning", "Budget exhausted.")
             break
 
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=messages,
-            tools=tools,
-            tool_choice="auto"
+        config = types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            tools=[python_tool],
+            temperature=0.1
         )
 
-        msg = response.choices[0].message
-        
-        # Build dictionary for assistant message to preserve tool calls in history
-        assistant_msg_dict = {"role": "assistant", "content": msg.content}
-        if msg.tool_calls:
-            assistant_msg_dict["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments
-                    }
-                } for tc in msg.tool_calls
-            ]
-        messages.append(assistant_msg_dict)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",  # Fast & reliable frontier model
+            contents=contents,
+            config=config
+        )
 
-        if msg.tool_calls:
-            for tool_call in msg.tool_calls:
-                args = json.loads(tool_call.function.arguments)
-                code = args.get("code", "")
-                log_event("tool_call", {"code": code})
+        # Check for function/tool calls
+        if response.function_calls:
+            for call in response.function_calls:
+                fn_name = call.name
+                fn_args = call.args
                 
-                output = run_python(code)
-                log_event("tool_output", {"output": output})
-                
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": output
-                })
+                if fn_name == "run_python":
+                    code = fn_args.get("code", "")
+                    log_event("tool_call", {"code": code})
+                    
+                    tool_output = run_python(code)
+                    log_event("tool_output", {"output": tool_output})
+                    
+                    # Append model response & function output to context
+                    contents.append(response.candidates[0].content)
+                    contents.append(types.Part.from_function_response(
+                        name="run_python",
+                        response={"result": tool_output}
+                    ))
         else:
-            final_text = msg.content
-            CHAT_HISTORIES[chat_id].append({"role": "assistant", "content": final_text})
+            final_text = response.text
+            CHAT_HISTORIES[chat_id].append({"role": "model", "parts": [{"text": final_text}]})
             log_event("agent_raw_output", final_text)
             return parse_and_clean_json(final_text)
 
     return {"answer": "error or timeout", "log_url": f"{BASE_URL}/run.jsonl"}
 
+# 5. Telegram Worker Loop
 def telegram_polling_worker():
     offset = 0
     while True:
@@ -180,9 +170,9 @@ def telegram_polling_worker():
                         
                         try:
                             result_json = run_agent(chat_id, text)
-                        except Exception as e:
-                            # Print trace to Render Logs for easy debugging
-                            print(f"CRITICAL AGENT ERROR: {traceback.format_exc()}")
+                        except Exception:
+                            # Print traceback in Render logs for easy debugging
+                            print(traceback.format_exc())
                             log_event("error", traceback.format_exc())
                             result_json = {"answer": "internal error", "log_url": f"{BASE_URL}/run.jsonl"}
 
@@ -192,10 +182,10 @@ def telegram_polling_worker():
                             "text": reply_str
                         })
                         log_event("sent_response", reply_str)
-        except Exception as e:
-            print(f"POLLING ERROR: {traceback.format_exc()}")
+        except Exception:
             time.sleep(5)
 
+# 6. Keep Alive Loop
 def keep_warm_worker():
     while True:
         time.sleep(600)
@@ -204,6 +194,7 @@ def keep_warm_worker():
         except Exception:
             pass
 
+# 7. FastAPI Routes & Startup
 @app.get("/health")
 def health():
     return {"ok": True, "status": "running"}
