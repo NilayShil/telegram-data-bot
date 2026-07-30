@@ -23,7 +23,6 @@ LOG_FILE = "run.jsonl"
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 CHAT_HISTORIES = {}
 
-# 1. Logging Helper
 def log_event(event_type, data):
     log_entry = {
         "timestamp": time.time(),
@@ -33,8 +32,15 @@ def log_event(event_type, data):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(log_entry) + "\n")
 
-# 2. Safe Python Execution Tool
 def run_python(code: str) -> str:
+    """Executes Python code safely and captures stdout or local variables."""
+    import sys
+    import io
+
+    # Redirect stdout to capture prints
+    old_stdout = sys.stdout
+    redirected_output = sys.stdout = io.StringIO()
+
     local_scope = {}
     try:
         exec_globals = {
@@ -44,12 +50,18 @@ def run_python(code: str) -> str:
             "bs4": __import__("bs4"),
         }
         exec(code, exec_globals, local_scope)
+        sys.stdout = old_stdout
+        
+        printed_val = redirected_output.getvalue()
+        if printed_val.strip():
+            return printed_val[-8000:]
+            
         output = local_scope.get("result", local_scope)
         return str(output)[-8000:]
     except Exception as e:
+        sys.stdout = old_stdout
         return f"Error executing code: {str(e)}"
 
-# 3. JSON Sanitizer
 def parse_and_clean_json(raw_text: str) -> dict:
     log_url = f"{BASE_URL}/run.jsonl"
     try:
@@ -66,7 +78,6 @@ def parse_and_clean_json(raw_text: str) -> dict:
     except Exception:
         return {"answer": raw_text, "log_url": log_url}
 
-# 4. Agent Execution Loop
 def run_agent(chat_id: int, user_message: str) -> dict:
     if chat_id not in CHAT_HISTORIES:
         CHAT_HISTORIES[chat_id] = []
@@ -101,7 +112,7 @@ def run_agent(chat_id: int, user_message: str) -> dict:
     start_time = time.time()
 
     for step in range(10):
-        if time.time() - start_time > 210:  # Timeout budget (210s)
+        if time.time() - start_time > 210:
             log_event("timeout_warning", "Budget exhausted.")
             break
 
@@ -113,7 +124,21 @@ def run_agent(chat_id: int, user_message: str) -> dict:
         )
 
         msg = response.choices[0].message
-        messages.append(msg)
+        
+        # Build dictionary for assistant message to preserve tool calls in history
+        assistant_msg_dict = {"role": "assistant", "content": msg.content}
+        if msg.tool_calls:
+            assistant_msg_dict["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments
+                    }
+                } for tc in msg.tool_calls
+            ]
+        messages.append(assistant_msg_dict)
 
         if msg.tool_calls:
             for tool_call in msg.tool_calls:
@@ -137,7 +162,6 @@ def run_agent(chat_id: int, user_message: str) -> dict:
 
     return {"answer": "error or timeout", "log_url": f"{BASE_URL}/run.jsonl"}
 
-# 5. Telegram Worker Loop
 def telegram_polling_worker():
     offset = 0
     while True:
@@ -156,7 +180,9 @@ def telegram_polling_worker():
                         
                         try:
                             result_json = run_agent(chat_id, text)
-                        except Exception:
+                        except Exception as e:
+                            # Print trace to Render Logs for easy debugging
+                            print(f"CRITICAL AGENT ERROR: {traceback.format_exc()}")
                             log_event("error", traceback.format_exc())
                             result_json = {"answer": "internal error", "log_url": f"{BASE_URL}/run.jsonl"}
 
@@ -166,10 +192,10 @@ def telegram_polling_worker():
                             "text": reply_str
                         })
                         log_event("sent_response", reply_str)
-        except Exception:
+        except Exception as e:
+            print(f"POLLING ERROR: {traceback.format_exc()}")
             time.sleep(5)
 
-# 6. Keep Alive Loop
 def keep_warm_worker():
     while True:
         time.sleep(600)
@@ -178,7 +204,6 @@ def keep_warm_worker():
         except Exception:
             pass
 
-# 7. FastAPI Routes & Startup
 @app.get("/health")
 def health():
     return {"ok": True, "status": "running"}
